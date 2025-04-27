@@ -1,11 +1,11 @@
-use std::error::Error;
-
 use solana_sdk::{
     instruction::Instruction,
     packet::PACKET_DATA_SIZE,
     pubkey::Pubkey,
     signer::keypair::Keypair,
 };
+
+use crate::error::SolendError;
 
 /**
     If the transaction doesn't contain a `setComputeUnitLimit` instruction, the default compute budget is 200,000 units per instruction.
@@ -73,90 +73,93 @@ pub fn get_size_of_transaction(
   instructions: Vec<Instruction>,
   versioned_transaction: bool,
   address_lookup_table_addresses: Option<Vec<Pubkey>>
-) -> Result<u16, impl Error> {
-  let mut programs: Vec<String> = vec![];
-  let mut signers: Vec<String> = vec![];
-  let mut accounts: Vec<String> = vec![];
-
-  instructions.iter().map(|ix| {
-    programs.push(ix.program_id.to_string());
-    accounts.push(ix.program_id.to_string());
-    ix.accounts.iter().map(|key| {
-      if key.is_signer {
-        signers.push(key.pubkey.to_string());
-      }
-      accounts.push(key.pubkey.to_string());
-    });
-  });
-
-  let instruction_sizes: u8 = match instructions
-    .iter()
-    .map(
-        |ix| {
-            let (comp_acct_size, comp_data_size): (u16, u16) = match (
-                ix.accounts.len().try_into(), 
-                ix.data.len().try_into()
-            ) {
-                (Ok(accts), Ok(data)) => (accts, data),
-                _ => (0, 0)
-            };
-            let ix_len: u16 = ix.data.len()
-                .try_into()
-                .expect("Instructions unexpectedly large!");
-            let ix_account_len: u16 = ix.accounts.len()
-                .try_into()
-                .expect("Accounts data unexpectedly large!");
-            return 1 +
-            get_size_of_compressed_u16(ix_account_len).into() + ix_account_len +
-            get_size_of_compressed_u16(ix_len).into() + ix_len
+) -> Result<u16, SolendError> {
+    let mut programs: Vec<String> = vec![];
+    let mut signers: Vec<String> = vec![];
+    let mut accounts: Vec<String> = vec![];
+    
+    for ix in &instructions {
+        programs.push(ix.program_id.to_string());
+        accounts.push(ix.program_id.to_string());
+        for key in &ix.accounts {
+            if key.is_signer {
+                signers.push(key.pubkey.to_string());
+            }
+            accounts.push(key.pubkey.to_string());   
         }
-    )
-    .reduce(|a, b| a + b) {
+    }
+
+    let mut ix_map = instructions
+        .iter()
+        .map(
+            |ix| -> Result<u16, SolendError> {
+                let ix_len: u16 = ix.data.len()
+                    .try_into()
+                    .map_err(|_| SolendError::ConversionWouldOverflow)?;
+                let ix_account_len: u16 = ix.accounts.len()
+                    .try_into()
+                    .map_err(|_| SolendError::ConversionWouldOverflow)?;
+                let ix_account_size_compressed: u16 = 
+                    get_size_of_compressed_u16(&ix_account_len)
+                    .into();
+                let ix_size_compressed: u16 = get_size_of_compressed_u16(&ix_len).into();
+                Ok(ix_account_len + ix_account_size_compressed + ix_size_compressed + ix_len + 1)
+            }
+        );
+    
+    if ix_map.any(|v| v.is_err()) {
+        return Err(SolendError::TransactionTooLarge);
+    }
+  
+    let instruction_sizes: u16 = match ix_map.map(|v| v.unwrap_or(0)).reduce(|a, b| a + b) {
         Some(size) => size,
         None => 0
     };
 
-  let mut number_of_address_lookups: u8 = 0;
+  let mut number_of_address_lookups: u16 = 0;
+  let signers_len: &u16 = &signers.len().try_into()
+      .map_err(|_| SolendError::ConversionWouldOverflow)?;
+  
   if let Some(address_lookup_table_addresses) = address_lookup_table_addresses {
     let lookup_table_addresses: Vec<String> = address_lookup_table_addresses.iter().map(| address |
       address.to_string()
     ).collect();
     let total_number_of_accounts = accounts.len();
-    accounts = vec!(
-      accounts
+    accounts = accounts
         .iter_mut()
         .filter(| account | !lookup_table_addresses.contains(account))
         .map(| account_key | account_key.to_owned())
-        .collect()
-    );
-    accounts = vec!(
-        [accounts, programs, signers]
-            .iter()
-            .flatten()
-            .map(| account_key | account_key.to_owned())
-            .collect()
-    );
-    number_of_address_lookups = (total_number_of_accounts - accounts.len()) // This number is equal to the number of accounts that are in the lookup table and are neither signers nor programs
-        .try_into()?;
+        .collect();
+    accounts = [accounts, programs, signers]
+        .iter()
+        .flatten()
+        .map(| account_key | account_key.to_owned())
+        .collect();
+    number_of_address_lookups = (total_number_of_accounts - accounts.len())
+        .try_into().map_err(|_| SolendError::ConversionWouldOverflow)?; // This number is equal to the number of accounts that are in the lookup table and are neither signers nor programs
   }
 
-  let signers_len: u16 = signers.len().try_into()?;
-  let accounts_len: u16 = accounts.len().try_into()?;
-  let instructions_len: u16 = instructions.len().try_into()?;    
+  let accounts_len: u16 = accounts.len().try_into()
+      .map_err(|_| SolendError::ConversionWouldOverflow)?;
+  let instructions_len: u16 = instructions.len().try_into()
+      .map_err(|_| SolendError::ConversionWouldOverflow)?;    
+  
+  let compressed_signers: u16 = get_size_of_compressed_u16(signers_len).into();
+  let compressed_accounts: u16 = get_size_of_compressed_u16(&accounts_len).into();
+  let compressed_instructions: u16 = get_size_of_compressed_u16(&instructions_len).into();
   
   return
-    Ok(get_size_of_compressed_u16(signers_len.into()).into() +
+    Ok(compressed_signers +
     signers_len * 64 + // array of signatures
-    3 +
-    get_size_of_compressed_u16(accounts_len.into()) +
+    3 + compressed_accounts +
     32 * accounts_len + // array of account addresses
     32 + // recent blockhash
-    get_size_of_compressed_u16(instructions_len.into()) +
+    compressed_instructions +
     instruction_sizes + // array of instructions
-    (if versioned_transaction { 1 + get_size_of_compressed_u16(0) } else { 0 }) + // transaction version and number of address lookup tables
-    (if versioned_transaction && address_lookup_table_addresses.is_some() { 32 } else { 0 }) + // address lookup table address (we only support 1 address lookup table)
-    (if versioned_transaction && address_lookup_table_addresses.is_some() { 2 } else { 0 }) + // number of address lookup indexes
-    number_of_address_lookups);
+    (if versioned_transaction { 2u16 } else { 0u16 }) + // transaction version and number of address lookup tables
+    (if versioned_transaction && number_of_address_lookups != 0 { 32u16 } else { 0u16 }) + // address lookup table address (we only support 1 address lookup table)
+    (if versioned_transaction && number_of_address_lookups != 0 { 2u16 } else { 0u16 }) + // number of address lookup indexes
+    number_of_address_lookups)
 }
 
 fn boolean_to_int(b: bool) -> u8 {
@@ -169,6 +172,6 @@ fn boolean_to_int(b: bool) -> u8 {
 /**
  * Get the size of n in bytes when serialized as a CompressedU16. Compact arrays use a CompactU16 to store the length of the array.
  */
-pub fn get_size_of_compressed_u16(n: u16) -> u8 {
-  return 1 + boolean_to_int(n >= 128) + boolean_to_int(n >= 16384);
+pub fn get_size_of_compressed_u16(n: &u16) -> u8 {
+  return 1 + boolean_to_int(n >= &128) + boolean_to_int(n >= &16384);
 }
