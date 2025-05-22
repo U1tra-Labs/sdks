@@ -1,2 +1,2 @@
 [workspace]
-members = ["crates/*"]
+members = ["crates/solend-sdk", "crates/marginfi-sdk", "crates/kamino-sdk"]

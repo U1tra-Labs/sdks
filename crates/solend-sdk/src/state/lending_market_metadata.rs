@@ -25,7 +25,7 @@ pub const LENDING_MARKET_METADATA_SIZE: usize = 111;
 
 impl LendingMarketMetadata {
     /// Get bincode configuration optimized for Solana
-    pub fn get_bincode_config() -> impl bincode::config::Options {
+    fn get_bincode_config() -> impl bincode::config::Options {
         let config = bincode::config::DefaultOptions::new();
         config.with_little_endian()
               .with_fixint_encoding()
